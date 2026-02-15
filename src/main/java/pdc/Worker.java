@@ -1,5 +1,7 @@
 package pdc;
 
+import java.nio.ByteBuffer;
+
 import java.io.*;
 import java.net.Socket;
 import java.util.concurrent.*;
@@ -46,15 +48,11 @@ public class Worker {
 
     public void joinCluster() {
         try (Socket socket = new Socket(masterHost, masterPort)) {
-            DataInputStream dis = new DataInputStream(socket.getInputStream());
-            DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
-
+            RpcHandler rpc = new RpcHandler(socket);
             // Send registration using new protocol
             Message reg = new Message();
             reg.type = Message.MessageType.REGISTER;
-            byte[] regData = reg.pack();
-            dos.write(regData);
-            dos.flush();
+            rpc.send(reg);
 
             // Start heartbeat thread
             Thread heartbeatThread = new Thread(() -> {
@@ -63,14 +61,9 @@ public class Worker {
                         Message heartbeat = new Message();
                         heartbeat.type = Message.MessageType.HEARTBEAT;
                         heartbeat.timestamp = System.currentTimeMillis();
-                        byte[] hbData = heartbeat.pack();
-                        synchronized (dos) {
-                            dos.write(hbData);
-                            dos.flush();
-                        }
+                        rpc.send(heartbeat);
                         Thread.sleep(2000);
                     } catch (Exception e) {
-                        // If socket is closed, exit thread
                         running = false;
                     }
                 }
@@ -80,17 +73,8 @@ public class Worker {
 
             // Communication loop
             while (running) {
-                // Read message framing: [length][type][payload]
-                byte[] header = new byte[4];
-                dis.readFully(header);
-                int msgLen = ByteBuffer.wrap(header).getInt();
-                byte[] msgBytes = new byte[msgLen];
-                dis.readFully(msgBytes);
-                byte[] fullMsg = new byte[4 + msgLen];
-                System.arraycopy(header, 0, fullMsg, 0, 4);
-                System.arraycopy(msgBytes, 0, fullMsg, 4, msgLen);
-                Message msg = Message.unpack(fullMsg);
-                handleMessage(msg, dos);
+                Message msg = rpc.receive();
+                handleMessage(msg, rpc);
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -102,16 +86,16 @@ public class Worker {
         new Thread(this::joinCluster).start();
     }
 
-    private void handleMessage(Message msg, DataOutputStream dos) throws IOException {
+    private void handleMessage(Message msg, RpcHandler rpc) {
         if (msg.type == Message.MessageType.TASK_ASSIGNMENT) {
-            taskExecutor.submit(() -> executeTask(msg, dos));
+            taskExecutor.submit(() -> executeTask(msg, rpc));
         } else if (msg.type == Message.MessageType.SHUTDOWN) {
             running = false;
         }
         // Heartbeat is handled by thread, no need to respond
     }
 
-    private void executeTask(Message req, DataOutputStream dos) {
+    private void executeTask(Message req, RpcHandler rpc) {
         try {
             // Compute assigned rows of matrixA * matrixB
             int[][] partialResult = null;
@@ -134,11 +118,7 @@ public class Worker {
             completion.type = Message.MessageType.TASK_RESULT;
             completion.taskId = req.taskId;
             completion.result = partialResult;
-            byte[] data = completion.pack();
-            synchronized (dos) {
-                dos.write(data);
-                dos.flush();
-            }
+            rpc.send(completion);
         } catch (Exception e) {
             e.printStackTrace();
         }
