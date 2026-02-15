@@ -57,126 +57,149 @@ public class Message {
             // messageType (length + bytes)
             byte[] typeBytes = messageType.getBytes(StandardCharsets.UTF_8);
             dos.writeInt(typeBytes.length);
-            dos.write(typeBytes);
+            package pdc;
 
-            // studentId (length + bytes)
-            byte[] senderBytes = studentId.getBytes(StandardCharsets.UTF_8);
-            dos.writeInt(senderBytes.length);
+            import java.io.*;
+            import java.nio.ByteBuffer;
+            import java.nio.charset.StandardCharsets;
             dos.write(senderBytes);
-
-            dos.writeLong(timestamp);
-
-            // payload (length + bytes, allow null)
-            if (payload == null) {
-                dos.writeInt(-1);
-            } else {
-                dos.writeInt(payload.length);
+            /**
+             * Message represents the communication unit in the CSM218 protocol.
+             * Implements a strict binary wire protocol with framing:
+             * [MESSAGE_LENGTH (4 bytes)][MESSAGE_TYPE (1 byte)][PAYLOAD]
+             * No JSON, no Java Serialization. Only manual binary packing.
+             */
                 dos.write(payload);
-            }
+                // Message Types for CSM218
+                public enum MessageType {
+                    REGISTER(1),
+                    TASK_ASSIGNMENT(2),
+                    TASK_RESULT(3),
+                    HEARTBEAT(4),
+                    SHUTDOWN(5);
 
-            dos.flush();
-            return baos.toByteArray();
-        } catch (IOException e) {
-            throw new RuntimeException("Packing failed", e);
-        }
-    }
+                    public final byte code;
+                    MessageType(int code) { this.code = (byte) code; }
+                    public static MessageType fromByte(byte b) {
+                        for (MessageType t : values()) if (t.code == b) return t;
+                        throw new IllegalArgumentException("Unknown MessageType code: " + b);
+                    }
+                }
 
-    /**
-     * Reconstructs a Message from a byte stream.
-     */
-    public static Message unpack(byte[] data) {
-        try {
-            ByteArrayInputStream bais = new ByteArrayInputStream(data);
-            DataInputStream dis = new DataInputStream(bais);
+                public MessageType type;
+                public int taskId; // Used for TASK_ASSIGNMENT, TASK_RESULT
+                public int[][] matrixA; // Used for TASK_ASSIGNMENT
+                public int[][] matrixB; // Used for TASK_ASSIGNMENT
+                public int[][] result; // Used for TASK_RESULT
+                public long timestamp; // Used for HEARTBEAT
 
-            Message msg = new Message();
-
-            // magic
-            int magicLen = dis.readInt();
+                // For extensibility, add more fields as needed
             byte[] magicBytes = new byte[magicLen];
             dis.readFully(magicBytes);
             msg.magic = new String(magicBytes, StandardCharsets.UTF_8);
 
-            msg.version = dis.readInt();
+                /**
+                 * Converts the message to a byte stream for network transmission.
+                 * Implements framing: [length][type][payload]
+                 */
+                public byte[] pack() {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    try {
+                        baos.write(0); // Placeholder for length (will fill later)
+                        baos.write(0);
+                        baos.write(0);
+                        baos.write(0);
+                        baos.write(type.code); // 1 byte for type
 
-            // messageType
-            int typeLen = dis.readInt();
-            byte[] typeBytes = new byte[typeLen];
-            dis.readFully(typeBytes);
-            msg.messageType = new String(typeBytes, StandardCharsets.UTF_8);
+                        // Payload depends on type
+                        switch (type) {
+                            case REGISTER:
+                            case HEARTBEAT:
+                            case SHUTDOWN:
+                                // Only timestamp for HEARTBEAT, nothing for REGISTER/SHUTDOWN
+                                if (type == MessageType.HEARTBEAT) {
+                                    baos.write(ByteBuffer.allocate(8).putLong(timestamp).array());
+                                }
+                                break;
+                            case TASK_ASSIGNMENT:
+                                // [taskId][matrixA][matrixB]
+                                baos.write(ByteBuffer.allocate(4).putInt(taskId).array());
+                                writeMatrix(baos, matrixA);
+                                writeMatrix(baos, matrixB);
+                                break;
+                            case TASK_RESULT:
+                                // [taskId][result]
+                                baos.write(ByteBuffer.allocate(4).putInt(taskId).array());
+                                writeMatrix(baos, result);
+                                break;
+                        }
+                        // Now fill in length
+                        byte[] msgBytes = baos.toByteArray();
+                        int len = msgBytes.length - 4;
+                        ByteBuffer.wrap(msgBytes, 0, 4).putInt(len);
+                        return msgBytes;
+                    } catch (IOException e) {
+                        throw new RuntimeException("Packing failed", e);
+                    }
+                }
 
-            // studentId
-            int senderLen = dis.readInt();
-            byte[] senderBytes = new byte[senderLen];
-            dis.readFully(senderBytes);
-            msg.studentId = new String(senderBytes, StandardCharsets.UTF_8);
+                /**
+                 * Reconstructs a Message from a byte stream.
+                 * Expects framing: [length][type][payload]
+                 */
+                public static Message unpack(byte[] data) {
+                    Message msg = new Message();
+                    ByteBuffer buf = ByteBuffer.wrap(data);
+                    int len = buf.getInt(); // total length (not used here)
+                    byte typeByte = buf.get();
+                    msg.type = MessageType.fromByte(typeByte);
+                    switch (msg.type) {
+                        case REGISTER:
+                        case SHUTDOWN:
+                            // No payload
+                            break;
+                        case HEARTBEAT:
+                            msg.timestamp = buf.getLong();
+                            break;
+                        case TASK_ASSIGNMENT:
+                            msg.taskId = buf.getInt();
+                            msg.matrixA = readMatrix(buf);
+                            msg.matrixB = readMatrix(buf);
+                            break;
+                        case TASK_RESULT:
+                            msg.taskId = buf.getInt();
+                            msg.result = readMatrix(buf);
+                            break;
+                    }
+                    return msg;
+                }
 
-            msg.timestamp = dis.readLong();
+                // Helper: Write matrix to stream
+                private static void writeMatrix(OutputStream os, int[][] matrix) throws IOException {
+                    if (matrix == null) {
+                        os.write(ByteBuffer.allocate(4).putInt(-1).array());
+                        return;
+                    }
+                    int rows = matrix.length;
+                    int cols = rows > 0 ? matrix[0].length : 0;
+                    os.write(ByteBuffer.allocate(4).putInt(rows).array());
+                    os.write(ByteBuffer.allocate(4).putInt(cols).array());
+                    for (int i = 0; i < rows; i++)
+                        for (int j = 0; j < cols; j++)
+                            os.write(ByteBuffer.allocate(4).putInt(matrix[i][j]).array());
+                }
 
-            // payload
-            int payloadLen = dis.readInt();
-            if (payloadLen >= 0) {
-                byte[] payloadBytes = new byte[payloadLen];
-                dis.readFully(payloadBytes);
-                msg.payload = payloadBytes;
-            } else {
-                msg.payload = null;
-            }
-
-            return msg;
-        } catch (IOException e) {
-            throw new RuntimeException("Unpacking failed", e);
-        }
-    }
-
-    public String toJson() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{");
-        sb.append("\"magic\":\"").append(magic).append("\",");
-        sb.append("\"version\":").append(version).append(",");
-        sb.append("\"messageType\":\"").append(messageType).append("\",");
-        sb.append("\"studentId\":\"").append(studentId).append("\",");
-        sb.append("\"timestamp\":").append(timestamp).append(",");
-        sb.append("\"payload\":\"").append(payload != null ? Base64.getEncoder().encodeToString(payload) : "")
-                .append("\"");
+                // Helper: Read matrix from buffer
+                private static int[][] readMatrix(ByteBuffer buf) {
+                    int rows = buf.getInt();
+                    if (rows == -1) return null;
+                    int cols = buf.getInt();
+                    int[][] matrix = new int[rows][cols];
+                    for (int i = 0; i < rows; i++)
+                        for (int j = 0; j < cols; j++)
+                            matrix[i][j] = buf.getInt();
+                    return matrix;
+                }
         sb.append("}");
-        return sb.toString();
-    }
-
-    public static Message parse(String json) {
-        Message msg = new Message();
-        if (json.contains("\"magic\":\""))
-            msg.magic = extract(json, "\"magic\":\"", "\"");
-        if (json.contains("\"version\":")) {
-            String v = extract(json, "\"version\":", ",");
-            msg.version = Integer.parseInt(v.trim());
-        }
-        if (json.contains("\"messageType\":\""))
-            msg.messageType = extract(json, "\"messageType\":\"", "\"");
-        if (json.contains("\"studentId\":\""))
-            msg.studentId = extract(json, "\"studentId\":\"", "\"");
-        if (json.contains("\"timestamp\":")) {
-            String ts = extract(json, "\"timestamp\":", ",");
-            if (ts.endsWith("}"))
-                ts = ts.substring(0, ts.length() - 1);
-            msg.timestamp = Long.parseLong(ts.trim());
-        }
-        if (json.contains("\"payload\":\"")) {
-            String p = extract(json, "\"payload\":\"", "\"");
-            if (!p.isEmpty())
-                msg.payload = Base64.getDecoder().decode(p);
-        }
-        return msg;
-    }
-
-    private static String extract(String json, String start, String end) {
-        int s = json.indexOf(start) + start.length();
-        int e = json.indexOf(end, s);
-        if (e == -1) {
-            e = json.indexOf("}", s);
-            if (e == -1)
-                e = json.length();
-        }
-        return json.substring(s, e);
-    }
-}
+                // ...existing code...
+            }

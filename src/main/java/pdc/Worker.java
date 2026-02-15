@@ -45,29 +45,53 @@ public class Worker {
     }
 
     public void joinCluster() {
-        try (Socket socket = new Socket(masterHost, masterPort);
-                DataInputStream dis = new DataInputStream(socket.getInputStream());
-                DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+        try (Socket socket = new Socket(masterHost, masterPort)) {
+            DataInputStream dis = new DataInputStream(socket.getInputStream());
+            DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
 
-            // Send registration
+            // Send registration using new protocol
             Message reg = new Message();
-            reg.messageType = Message.REGISTER_WORKER;
-            reg.studentId = studentId;
-            reg.timestamp = System.currentTimeMillis();
+            reg.type = Message.MessageType.REGISTER;
             byte[] regData = reg.pack();
-            dos.writeInt(regData.length);
             dos.write(regData);
             dos.flush();
 
-            // Handle communication loop
+            // Start heartbeat thread
+            Thread heartbeatThread = new Thread(() -> {
+                while (running) {
+                    try {
+                        Message heartbeat = new Message();
+                        heartbeat.type = Message.MessageType.HEARTBEAT;
+                        heartbeat.timestamp = System.currentTimeMillis();
+                        byte[] hbData = heartbeat.pack();
+                        synchronized (dos) {
+                            dos.write(hbData);
+                            dos.flush();
+                        }
+                        Thread.sleep(2000);
+                    } catch (Exception e) {
+                        // If socket is closed, exit thread
+                        running = false;
+                    }
+                }
+            });
+            heartbeatThread.setDaemon(true);
+            heartbeatThread.start();
+
+            // Communication loop
             while (running) {
-                int len = dis.readInt();
-                byte[] data = new byte[len];
-                dis.readFully(data);
-                Message msg = Message.unpack(data);
+                // Read message framing: [length][type][payload]
+                byte[] header = new byte[4];
+                dis.readFully(header);
+                int msgLen = ByteBuffer.wrap(header).getInt();
+                byte[] msgBytes = new byte[msgLen];
+                dis.readFully(msgBytes);
+                byte[] fullMsg = new byte[4 + msgLen];
+                System.arraycopy(header, 0, fullMsg, 0, 4);
+                System.arraycopy(msgBytes, 0, fullMsg, 4, msgLen);
+                Message msg = Message.unpack(fullMsg);
                 handleMessage(msg, dos);
             }
-
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -79,79 +103,43 @@ public class Worker {
     }
 
     private void handleMessage(Message msg, DataOutputStream dos) throws IOException {
-        if (Message.HEARTBEAT.equals(msg.messageType)) {
-            // Respond to heartbeat
-            Message response = new Message();
-            response.messageType = Message.HEARTBEAT;
-            response.studentId = studentId;
-            response.timestamp = System.currentTimeMillis();
-            byte[] data = response.pack();
-            synchronized (dos) {
-                dos.writeInt(data.length);
-                dos.write(data);
-                dos.flush();
-            }
-        } else if (Message.RPC_REQUEST.equals(msg.messageType)) {
+        if (msg.type == Message.MessageType.TASK_ASSIGNMENT) {
             taskExecutor.submit(() -> executeTask(msg, dos));
+        } else if (msg.type == Message.MessageType.SHUTDOWN) {
+            running = false;
         }
+        // Heartbeat is handled by thread, no need to respond
     }
 
     private void executeTask(Message req, DataOutputStream dos) {
         try {
-            // Task format: rowA;fullB
-            // Let's assume binary payload format: [lenA] [rowA...] [rowsB] [colsB]
-            // [matrixB...]
-            DataInputStream dis = new DataInputStream(new ByteArrayInputStream(req.payload));
-
-            // Read Row A
-            int lenA = dis.readInt();
-            int[] rowA = new int[lenA];
-            for (int i = 0; i < lenA; i++)
-                rowA[i] = dis.readInt();
-
-            // Read Full Matrix B
-            int rowsB = dis.readInt();
-            int colsB = dis.readInt();
-            int[][] matrixB = new int[rowsB][colsB];
-            for (int i = 0; i < rowsB; i++) {
-                for (int j = 0; j < colsB; j++) {
-                    matrixB[i][j] = dis.readInt();
-                }
-            }
-
-            // Perform Multiplication: resultRow = rowA * matrixB
-            // resultRow[j] = sum(rowA[k] * matrixB[k][j])
-            int[] resultRow = new int[colsB];
-            for (int j = 0; j < colsB; j++) {
-                int sum = 0;
-                for (int k = 0; k < lenA; k++) {
-                    if (k < rowsB) {
-                        sum += rowA[k] * matrixB[k][j];
+            // Compute assigned rows of matrixA * matrixB
+            int[][] partialResult = null;
+            if (req.matrixA != null && req.matrixB != null) {
+                int rows = req.matrixA.length;
+                int cols = req.matrixB[0].length;
+                partialResult = new int[rows][cols];
+                for (int i = 0; i < rows; i++) {
+                    for (int j = 0; j < cols; j++) {
+                        int sum = 0;
+                        for (int k = 0; k < req.matrixA[0].length; k++) {
+                            sum += req.matrixA[i][k] * req.matrixB[k][j];
+                        }
+                        partialResult[i][j] = sum;
                     }
                 }
-                resultRow[j] = sum;
             }
-
-            // Serialize result
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream out = new DataOutputStream(baos);
-            out.writeInt(resultRow.length);
-            for (int val : resultRow)
-                out.writeInt(val);
-
-            // Send completion
+            // Send result
             Message completion = new Message();
-            completion.messageType = Message.TASK_COMPLETE;
-            completion.studentId = studentId;
-            completion.timestamp = System.currentTimeMillis();
-            completion.payload = baos.toByteArray();
+            completion.type = Message.MessageType.TASK_RESULT;
+            completion.taskId = req.taskId;
+            completion.result = partialResult;
             byte[] data = completion.pack();
             synchronized (dos) {
-                dos.writeInt(data.length);
                 dos.write(data);
                 dos.flush();
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             e.printStackTrace();
         }
     }

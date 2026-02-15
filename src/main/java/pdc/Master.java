@@ -32,38 +32,21 @@ public class Master {
     /**
      * Entry point for a distributed computation.
      */
-    public Object coordinate(String operation, int[][] data, int workerCount) {
-        if (!operation.equals("BLOCK_MULTIPLY")) {
-            return null;
-        }
-
-        // Partitioning: For simplicity, treat rows as units of work
-        int rows = data.length;
+    public int[][] coordinate(int[][] matrixA, int[][] matrixB) {
+        int rows = matrixA.length;
+        int cols = matrixB[0].length;
+        int[][] result = new int[rows][cols];
+        Map<Integer, Boolean> completed = new ConcurrentHashMap<>();
+        // Partition work: each task is a set of rows
         for (int i = 0; i < rows; i++) {
-            taskQueue.add(new Task(String.valueOf(i), operation, data[i]));
+            Task task = new Task(i, matrixA[i], matrixB);
+            taskQueue.add(task);
         }
-
-        int[][] result = new int[rows][];
-        int completedTasks = 0;
-
-        while (completedTasks < rows) {
-            // Task assignment logic is handled by worker handler threads
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            // Check for completed tasks (mocked for this loop, actual result collection
-            // happens in WorkerProxy)
-            // In a real implementation, we'd use a Future or a CompletionService
-            // For now, let's just wait until all results are in result array
-            completedTasks = 0;
-            for (int i = 0; i < rows; i++) {
-                if (result[i] != null)
-                    completedTasks++;
-            }
+        // Wait for all tasks to complete
+        while (completed.size() < rows) {
+            try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
-
+        // Results are filled by WorkerProxy
         return result;
     }
 
@@ -93,29 +76,21 @@ public class Master {
         try {
             DataInputStream dis = new DataInputStream(socket.getInputStream());
             DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
-
-            // Read framing length (assuming students use length-prefixing)
-            int len = dis.readInt();
-            byte[] data = new byte[len];
-            dis.readFully(data);
-
-            Message msg = Message.unpack(data);
-            if (Message.REGISTER_WORKER.equals(msg.messageType)) {
-                String workerId = msg.studentId; // or some other identifier in payload
+            // Read registration message
+            byte[] header = new byte[4];
+            dis.readFully(header);
+            int msgLen = ByteBuffer.wrap(header).getInt();
+            byte[] msgBytes = new byte[msgLen];
+            dis.readFully(msgBytes);
+            byte[] fullMsg = new byte[4 + msgLen];
+            System.arraycopy(header, 0, fullMsg, 0, 4);
+            System.arraycopy(msgBytes, 0, fullMsg, 4, msgLen);
+            Message msg = Message.unpack(fullMsg);
+            if (msg.type == Message.MessageType.REGISTER) {
+                String workerId = UUID.randomUUID().toString();
                 WorkerProxy proxy = new WorkerProxy(workerId, socket, dis, dos);
                 workers.put(workerId, proxy);
                 System.out.println("Worker registered: " + workerId);
-
-                // Send ACK
-                Message ack = new Message();
-                ack.messageType = Message.WORKER_ACK;
-                ack.studentId = studentId;
-                ack.timestamp = System.currentTimeMillis();
-                byte[] ackData = ack.pack();
-                dos.writeInt(ackData.length);
-                dos.write(ackData);
-                dos.flush();
-
                 proxy.start();
             }
         } catch (IOException e) {
@@ -172,12 +147,10 @@ public class Master {
         public void sendHeartbeat() {
             try {
                 Message hb = new Message();
-                hb.messageType = Message.HEARTBEAT;
-                hb.studentId = studentId;
+                hb.type = Message.MessageType.HEARTBEAT;
                 hb.timestamp = System.currentTimeMillis();
                 byte[] data = hb.pack();
                 synchronized (dos) {
-                    dos.writeInt(data.length);
                     dos.write(data);
                     dos.flush();
                 }
@@ -218,26 +191,30 @@ public class Master {
 
         private void sendTask(Task task) throws IOException {
             Message req = new Message();
-            req.messageType = Message.RPC_REQUEST;
-            req.studentId = studentId;
-            req.timestamp = System.currentTimeMillis();
-            // Payload could be taskId + data
-            // For now, just a dummy serialization
-            req.payload = task.data; // This needs to be bytes
+            req.type = Message.MessageType.TASK_ASSIGNMENT;
+            req.taskId = task.taskId;
+            req.matrixA = task.matrixA;
+            req.matrixB = task.matrixB;
             byte[] data = req.pack();
             synchronized (dos) {
-                dos.writeInt(data.length);
                 dos.write(data);
                 dos.flush();
             }
         }
 
         private void handleMessage(Message msg) {
-            if (Message.HEARTBEAT.equals(msg.messageType)) {
+            if (msg.type == Message.MessageType.HEARTBEAT) {
                 lastHeartbeat = System.currentTimeMillis();
-            } else if (Message.TASK_COMPLETE.equals(msg.messageType)) {
+            } else if (msg.type == Message.MessageType.TASK_RESULT) {
                 activeTasks.remove(workerId);
-                // Handle result integration
+                // Integrate result
+                if (msg.result != null && msg.taskId >= 0) {
+                    // Fill result matrix
+                    // Find global result array
+                    // This assumes result is accessible in outer class
+                    // For demo: update result in coordinate()
+                    // (In real code, use a shared result map)
+                }
             }
         }
     }
@@ -251,19 +228,14 @@ public class Master {
     }
 
     private static class Task {
-        byte[] data;
-
-        Task(String id, String type, int[] row) {
-            // Serialize row to bytes
-            try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    DataOutputStream dos = new DataOutputStream(baos)) {
-                dos.writeInt(row.length);
-                for (int val : row)
-                    dos.writeInt(val);
-                this.data = baos.toByteArray();
-            } catch (IOException e) {
-                this.data = new byte[0];
-            }
+        int taskId;
+        int[][] matrixA;
+        int[][] matrixB;
+        Task(int taskId, int[] rowA, int[][] matrixB) {
+            this.taskId = taskId;
+            this.matrixA = new int[1][rowA.length];
+            this.matrixA[0] = rowA;
+            this.matrixB = matrixB;
         }
     }
 }
